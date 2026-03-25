@@ -21,8 +21,64 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+use serde::Deserialize;
 
 use crate::credential_store;
+
+const PROXY_ENV_VARS: &[&str] = &[
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+];
+
+/// Response from Google's token endpoint
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[allow(dead_code)]
+    expires_in: u64,
+    #[allow(dead_code)]
+    token_type: String,
+}
+
+/// Refresh an access token using reqwest (supports HTTP proxy via environment variables).
+/// This is used as a fallback when yup-oauth2's hyper-based client fails due to proxy issues.
+async fn refresh_token_with_reqwest(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> anyhow::Result<String> {
+    let client = crate::client::shared_client().map_err(anyhow::Error::from)?;
+    let params = [
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ];
+
+    let response = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&params)
+        .send()
+        .await
+        .context("Failed to send token refresh request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response_text_or_placeholder(response.text().await);
+        anyhow::bail!("Token refresh failed with status {}: {}", status, body);
+    }
+
+    let token_response: TokenResponse = response
+        .json()
+        .await
+        .context("Failed to parse token response")?;
+
+    Ok(token_response.access_token)
+}
 
 /// Returns the project ID to be used for quota and billing (sets the `x-goog-user-project` header).
 ///
@@ -173,14 +229,37 @@ pub async fn get_token(scopes: &[&str]) -> anyhow::Result<String> {
     get_token_inner(scopes, creds, &token_cache).await
 }
 
+/// Check if HTTP proxy environment variables are set
+pub(crate) fn has_proxy_env() -> bool {
+    PROXY_ENV_VARS
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
+pub(crate) fn response_text_or_placeholder<E>(result: Result<String, E>) -> String {
+    result.unwrap_or_else(|_| "(could not read error response body)".to_string())
+}
+
 async fn get_token_inner(
     scopes: &[&str],
     creds: Credential,
     token_cache_path: &std::path::Path,
 ) -> anyhow::Result<String> {
     match creds {
-        Credential::AuthorizedUser(secret) => {
-            let auth = yup_oauth2::AuthorizedUserAuthenticator::builder(secret)
+        Credential::AuthorizedUser(ref secret) => {
+            // If proxy env vars are set, use reqwest directly (it supports proxy)
+            // This avoids waiting for yup-oauth2's hyper client to timeout
+            if has_proxy_env() {
+                return refresh_token_with_reqwest(
+                    &secret.client_id,
+                    &secret.client_secret,
+                    &secret.refresh_token,
+                )
+                .await;
+            }
+
+            // No proxy - use yup-oauth2 (faster, has token caching)
+            let auth = yup_oauth2::AuthorizedUserAuthenticator::builder(secret.clone())
                 .with_storage(Box::new(crate::token_storage::EncryptedTokenStorage::new(
                     token_cache_path.to_path_buf(),
                 )))
@@ -396,6 +475,43 @@ mod tests {
                 None => std::env::remove_var(&self.name),
             }
         }
+    }
+
+    fn clear_proxy_env() -> Vec<EnvVarGuard> {
+        PROXY_ENV_VARS
+            .iter()
+            .map(|key| EnvVarGuard::remove(key))
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn has_proxy_env_returns_false_when_unset() {
+        let _guards = clear_proxy_env();
+        assert!(!has_proxy_env());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn has_proxy_env_returns_true_when_set() {
+        let mut guards = clear_proxy_env();
+        guards.push(EnvVarGuard::set(
+            "HTTPS_PROXY",
+            "http://proxy.internal:8080",
+        ));
+        assert!(has_proxy_env());
+    }
+
+    #[test]
+    fn response_text_or_placeholder_returns_body() {
+        let body = response_text_or_placeholder(Result::<String, ()>::Ok("error body".to_string()));
+        assert_eq!(body, "error body");
+    }
+
+    #[test]
+    fn response_text_or_placeholder_returns_placeholder_on_error() {
+        let body = response_text_or_placeholder(Result::<String, ()>::Err(()));
+        assert_eq!(body, "(could not read error response body)");
     }
 
     #[tokio::test]
